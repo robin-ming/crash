@@ -76,6 +76,9 @@ static int loongarch64_get_frame(struct bt_info *bt, ulong *pcp, ulong *spp);
 static int loongarch64_init_active_task_regs(void);
 static int loongarch64_get_crash_notes(void);
 static int loongarch64_get_elf_notes(void);
+static void loongarch64_irq_stack_init(void);
+static int loongarch64_on_irq_stack(int cpu, ulong stkptr);
+static void loongarch64_set_irq_stack(struct bt_info *bt);
 
 /*
  * 3 Levels paging       PAGE_SIZE=16KB
@@ -454,6 +457,11 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 	current.sp = bt->stkptr;
 	current.ra = 0;
 
+	if (!INSTACK(current.sp, bt) &&
+	    (bt->flags & BT_REGS_NOT_FOUND) == 0 &&
+	    loongarch64_on_irq_stack(bt->tc->processor, current.sp))
+		loongarch64_set_irq_stack(bt);
+
 	if (!INSTACK(current.sp, bt))
 		return;
 
@@ -793,6 +801,55 @@ loongarch64_stackframe_init(void)
 
 	MEMBER_OFFSET_INIT(elf_prstatus_pr_reg, "elf_prstatus", "pr_reg");
 	STRUCT_SIZE_INIT(note_buf, "note_buf_t");
+	loongarch64_irq_stack_init();
+}
+
+static void
+loongarch64_irq_stack_init(void)
+{
+	int i;
+	struct syment *sp;
+	struct machine_specific *ms = machdep->machspec;
+	ulong p;
+
+	if (!(symbol_exists("irq_stack") &&
+	    (sp = per_cpu_symbol_search("irq_stack"))))
+		return;
+
+	ms->irq_stack_size = machdep->stacksize;
+	if (!(ms->irq_stacks = (ulong *)malloc((size_t)(kt->cpus * sizeof(ulong)))))
+		error(FATAL, "cannot malloc irq_stack addresses\n");
+
+	machdep->flags |= IRQSTACKS;
+
+	for (i = 0; i < kt->cpus; i++) {
+		p = kt->__per_cpu_offset[i] + sp->value;
+		if (!readmem(p, KVADDR, &ms->irq_stacks[i], sizeof(ulong),
+		    "IRQ stack pointer", RETURN_ON_ERROR))
+			ms->irq_stacks[i] = 0;
+	}
+}
+
+static int
+loongarch64_on_irq_stack(int cpu, ulong stkptr)
+{
+	struct machine_specific *ms = machdep->machspec;
+
+	if (!ms->irq_stacks || !ms->irq_stacks[cpu] || !ms->irq_stack_size)
+		return FALSE;
+
+	return (stkptr >= ms->irq_stacks[cpu]) &&
+	    (stkptr < (ms->irq_stacks[cpu] + ms->irq_stack_size));
+}
+
+static void
+loongarch64_set_irq_stack(struct bt_info *bt)
+{
+	struct machine_specific *ms = machdep->machspec;
+
+	bt->stackbase = ms->irq_stacks[bt->tc->processor];
+	bt->stacktop = bt->stackbase + ms->irq_stack_size;
+	alter_stackbuf(bt);
 }
 
 /*

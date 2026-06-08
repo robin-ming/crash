@@ -7336,6 +7336,8 @@ struct machine_specific {
 	ulong modules_vaddr;
 	ulong modules_end;
 
+	ulong irq_stack_size;
+	ulong *irq_stacks;
 	struct loongarch64_pt_regs *crash_task_regs;
 };
 
