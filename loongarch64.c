@@ -79,6 +79,10 @@ static int loongarch64_get_elf_notes(void);
 static void loongarch64_irq_stack_init(void);
 static int loongarch64_on_irq_stack(int cpu, ulong stkptr);
 static void loongarch64_set_irq_stack(struct bt_info *bt);
+static int loongarch64_switch_from_irq_stack(struct bt_info *bt,
+			struct loongarch64_unwind_frame *current);
+static int loongarch64_find_next_kernel_text(struct bt_info *bt,
+			struct loongarch64_unwind_frame *current);
 
 /*
  * 3 Levels paging       PAGE_SIZE=16KB
@@ -478,11 +482,22 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 			fprintf(fp, "level %d pc %#lx ra %#lx sp %lx\n",
 				level, current.pc, current.ra, current.sp);
 
-		if (!IS_KVADDR(current.pc) && !invalid_ok)
+		if (!IS_KVADDR(current.pc) && !invalid_ok) {
+			if (loongarch64_switch_from_irq_stack(bt, &current) ||
+			    loongarch64_find_next_kernel_text(bt, &current)) {
+				invalid_ok = 1;
+				continue;
+			}
 			return;
+		}
 
 		symbol = value_search(current.pc, &offset);
 		if (!symbol && !invalid_ok) {
+			if (loongarch64_switch_from_irq_stack(bt, &current) ||
+			    loongarch64_find_next_kernel_text(bt, &current)) {
+				invalid_ok = 1;
+				continue;
+			}
 			error(FATAL, "PC is unknown symbol (%lx)", current.pc);
 			return;
 		}
@@ -618,11 +633,17 @@ loongarch64_analyze_function(ulong start, ulong offset,
 
 	previous->sp = current->sp + spadjust;
 
-	if (rapos && !readmem(rapos, KVADDR, &current->ra,
-			      sizeof(current->ra), "RA from stack",
-			      RETURN_ON_ERROR)) {
-		error(FATAL, "Cannot read RA from stack %lx", rapos);
-		return;
+	if (rapos) {
+		ulong ra;
+
+		if (!readmem(rapos, KVADDR, &ra, sizeof(ra), "RA from stack",
+		     RETURN_ON_ERROR)) {
+			error(FATAL, "Cannot read RA from stack %lx", rapos);
+			return;
+		}
+
+		if (IS_KVADDR(ra) || !IS_KVADDR(current->ra))
+			current->ra = ra;
 	}
 }
 
@@ -850,6 +871,60 @@ loongarch64_set_irq_stack(struct bt_info *bt)
 	bt->stackbase = ms->irq_stacks[bt->tc->processor];
 	bt->stacktop = bt->stackbase + ms->irq_stack_size;
 	alter_stackbuf(bt);
+}
+
+static int
+loongarch64_switch_from_irq_stack(struct bt_info *bt,
+			struct loongarch64_unwind_frame *current)
+{
+	struct machine_specific *ms = machdep->machspec;
+	ulong saved_sp_addr, saved_sp;
+
+	if (!loongarch64_on_irq_stack(bt->tc->processor, current->sp))
+		return FALSE;
+
+	saved_sp_addr = ms->irq_stacks[bt->tc->processor] +
+	    ms->irq_stack_size - 16;
+	if (!readmem(saved_sp_addr, KVADDR, &saved_sp, sizeof(saved_sp),
+	    "saved task stack pointer", RETURN_ON_ERROR))
+		return FALSE;
+
+	bt->stackbase = GET_STACKBASE(bt->task);
+	bt->stacktop = GET_STACKTOP(bt->task);
+	if (!INSTACK(saved_sp, bt))
+		return FALSE;
+
+	alter_stackbuf(bt);
+	current->sp = saved_sp;
+	current->ra = 0;
+
+	return loongarch64_find_next_kernel_text(bt, current);
+}
+
+static int
+loongarch64_find_next_kernel_text(struct bt_info *bt,
+			struct loongarch64_unwind_frame *current)
+{
+	ulong sp, pc, offset;
+	struct syment *symbol;
+
+	for (sp = current->sp + sizeof(ulong); sp < bt->stacktop;
+	    sp += sizeof(ulong)) {
+		GET_STACK_DATA(sp, &pc, sizeof(pc));
+		if (!is_kernel_text(pc))
+			continue;
+
+		symbol = value_search(pc, &offset);
+		if (!symbol || STREQ(symbol->name, "_PROCEDURE_LINKAGE_TABLE_") ||
+		    STREQ(symbol->name, "empty_zero_page"))
+			continue;
+
+		current->pc = pc;
+		current->sp = sp;
+		return TRUE;
+	}
+
+	return FALSE;
 }
 
 /*
