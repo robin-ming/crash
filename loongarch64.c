@@ -95,6 +95,8 @@ static int loongarch64_is_exception_entry(struct syment *sym);
 static ulong loongarch64_exception_pc(int cpu, ulong pc);
 static int loongarch64_is_unwind_text(ulong pc);
 static int loongarch64_use_irq_prstatus_ra(ulong pc, ulong ra);
+static int loongarch64_valid_saved_regs(struct bt_info *bt,
+			struct loongarch64_pt_regs *regs, ulong *pc);
 static int loongarch64_eframe_search(struct bt_info *bt);
 static void loongarch64_display_full_frame(struct bt_info *bt,
 			struct loongarch64_unwind_frame *current,
@@ -930,6 +932,27 @@ loongarch64_use_irq_prstatus_ra(ulong pc, ulong ra)
 	    STREQ(rasym->name, "handle_cpu_irq");
 }
 
+static int
+loongarch64_valid_saved_regs(struct bt_info *bt,
+			struct loongarch64_pt_regs *regs, ulong *pc)
+{
+	ulong saved_pc;
+
+	saved_pc = loongarch64_exception_pc(bt->tc->processor, regs->csr_epc);
+	if (!loongarch64_is_unwind_text(saved_pc))
+		return FALSE;
+
+	if (!INSTACK(regs->regs[LOONGARCH64_EF_SP], bt))
+		return FALSE;
+
+	if (regs->regs[LOONGARCH64_EF_RA] &&
+	    !loongarch64_is_unwind_text(regs->regs[LOONGARCH64_EF_RA]))
+		return FALSE;
+
+	*pc = saved_pc;
+	return TRUE;
+}
+
 /*
  * 'bt -f' commend output
  * Display all stack data contained in a frame
@@ -1328,7 +1351,7 @@ loongarch64_switch_from_irq_stack(struct bt_info *bt,
 	struct machine_specific *ms = machdep->machspec;
 	struct loongarch64_pt_regs *regs;
 	char pt_regs[SIZE(pt_regs)];
-	ulong saved_sp_addr, saved_sp;
+	ulong saved_sp_addr, saved_sp, saved_pc;
 
 	if (!ms->irq_stacks || current->sp < ms->irq_stacks[bt->tc->processor] ||
 	    current->sp > ms->irq_stacks[bt->tc->processor] +
@@ -1350,9 +1373,8 @@ loongarch64_switch_from_irq_stack(struct bt_info *bt,
 	if (saved_sp <= bt->stacktop - SIZE(pt_regs)) {
 		GET_STACK_DATA(saved_sp, pt_regs, sizeof(pt_regs));
 		regs = (struct loongarch64_pt_regs *)(pt_regs + OFFSET(pt_regs_regs));
-		if (INSTACK(regs->regs[LOONGARCH64_EF_SP], bt)) {
-			current->pc = loongarch64_exception_pc(bt->tc->processor,
-			    regs->csr_epc);
+		if (loongarch64_valid_saved_regs(bt, regs, &saved_pc)) {
+			current->pc = saved_pc;
 			current->sp = regs->regs[LOONGARCH64_EF_SP];
 			current->ra = regs->regs[LOONGARCH64_EF_RA];
 			current->fp = regs->regs[LOONGARCH64_EF_FP];
