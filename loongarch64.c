@@ -1326,6 +1326,8 @@ loongarch64_switch_from_irq_stack(struct bt_info *bt,
 			struct loongarch64_unwind_frame *current)
 {
 	struct machine_specific *ms = machdep->machspec;
+	struct loongarch64_pt_regs *regs;
+	char pt_regs[SIZE(pt_regs)];
 	ulong saved_sp_addr, saved_sp;
 
 	if (!ms->irq_stacks || current->sp < ms->irq_stacks[bt->tc->processor] ||
@@ -1345,9 +1347,21 @@ loongarch64_switch_from_irq_stack(struct bt_info *bt,
 		return FALSE;
 
 	alter_stackbuf(bt);
+	if (saved_sp <= bt->stacktop - SIZE(pt_regs)) {
+		GET_STACK_DATA(saved_sp, pt_regs, sizeof(pt_regs));
+		regs = (struct loongarch64_pt_regs *)(pt_regs + OFFSET(pt_regs_regs));
+		if (INSTACK(regs->regs[LOONGARCH64_EF_SP], bt)) {
+			current->pc = loongarch64_exception_pc(bt->tc->processor,
+			    regs->csr_epc);
+			current->sp = regs->regs[LOONGARCH64_EF_SP];
+			current->ra = regs->regs[LOONGARCH64_EF_RA];
+			current->fp = regs->regs[LOONGARCH64_EF_FP];
+			return TRUE;
+		}
+	}
+
 	current->sp = saved_sp;
 	current->ra = 0;
-
 	return loongarch64_find_next_kernel_text(bt, current);
 }
 
