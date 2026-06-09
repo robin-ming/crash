@@ -67,6 +67,7 @@ typedef struct __attribute__((__packed__)) {
 
 #define LOONGARCH64_LOOKUP_BLOCK_ORDER	8
 #define LOONGARCH64_LOOKUP_BLOCK_SIZE	(1 << LOONGARCH64_LOOKUP_BLOCK_ORDER)
+#define LOONGARCH64_INSN_SIZE		4
 #define LOONGARCH64_VECSIZE		0x200
 #define LOONGARCH64_EXCCODE_INT_START	64
 #define LOONGARCH64_EXCCODE_INT_END	78
@@ -1246,9 +1247,12 @@ loongarch64_orc_unwind(struct bt_info *bt,
 		} else {
 			return FALSE;
 		}
+		if (pcval >= LOONGARCH64_INSN_SIZE)
+			pcval -= LOONGARCH64_INSN_SIZE;
 		pcval = loongarch64_orc_adjust_pc(bt->tc->processor, pcval);
-		if (!pcval)
-			pcval = loongarch64_orc_adjust_pc(bt->tc->processor, current->ra);
+		if (!pcval && current->ra >= LOONGARCH64_INSN_SIZE)
+			pcval = loongarch64_orc_adjust_pc(bt->tc->processor,
+			    current->ra - LOONGARCH64_INSN_SIZE);
 		if (!pcval)
 			return FALSE;
 		previous->sp = cfa;
@@ -1327,7 +1331,8 @@ loongarch64_on_irq_stack(int cpu, ulong stkptr)
 {
 	struct machine_specific *ms = machdep->machspec;
 
-	if (!ms->irq_stacks || !ms->irq_stacks[cpu] || !ms->irq_stack_size)
+	if (cpu < 0 || cpu >= kt->cpus || !ms->irq_stacks ||
+	    !ms->irq_stacks[cpu] || !ms->irq_stack_size)
 		return FALSE;
 
 	return (stkptr >= ms->irq_stacks[cpu]) &&
@@ -1351,24 +1356,30 @@ loongarch64_switch_from_irq_stack(struct bt_info *bt,
 	struct machine_specific *ms = machdep->machspec;
 	struct loongarch64_pt_regs *regs;
 	char pt_regs[SIZE(pt_regs)];
-	ulong saved_sp_addr, saved_sp, saved_pc;
+	ulong irq_stack, saved_sp_addr, saved_sp, saved_pc;
+	ulong task_stackbase, task_stacktop;
 
-	if (!ms->irq_stacks || current->sp < ms->irq_stacks[bt->tc->processor] ||
-	    current->sp > ms->irq_stacks[bt->tc->processor] +
-	    ms->irq_stack_size + 64)
+	if (bt->tc->processor < 0 || bt->tc->processor >= kt->cpus ||
+	    !ms->irq_stacks || !ms->irq_stack_size)
 		return FALSE;
 
-	saved_sp_addr = ms->irq_stacks[bt->tc->processor] +
-	    ms->irq_stack_size - 16;
+	irq_stack = ms->irq_stacks[bt->tc->processor];
+	if (!irq_stack || current->sp < irq_stack ||
+	    current->sp > irq_stack + ms->irq_stack_size + 64)
+		return FALSE;
+
+	saved_sp_addr = irq_stack + ms->irq_stack_size - 16;
 	if (!readmem(saved_sp_addr, KVADDR, &saved_sp, sizeof(saved_sp),
 	    "saved task stack pointer", RETURN_ON_ERROR))
 		return FALSE;
 
-	bt->stackbase = GET_STACKBASE(bt->task);
-	bt->stacktop = GET_STACKTOP(bt->task);
-	if (!INSTACK(saved_sp, bt))
+	task_stackbase = GET_STACKBASE(bt->task);
+	task_stacktop = GET_STACKTOP(bt->task);
+	if (saved_sp < task_stackbase || saved_sp >= task_stacktop)
 		return FALSE;
 
+	bt->stackbase = task_stackbase;
+	bt->stacktop = task_stacktop;
 	alter_stackbuf(bt);
 	if (saved_sp <= bt->stacktop - SIZE(pt_regs)) {
 		GET_STACK_DATA(saved_sp, pt_regs, sizeof(pt_regs));
