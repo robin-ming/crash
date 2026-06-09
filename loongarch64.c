@@ -41,7 +41,32 @@ struct loongarch64_unwind_frame {
         unsigned long sp;
         unsigned long pc;
         unsigned long ra;
+        unsigned long fp;
 };
+
+typedef struct __attribute__((__packed__)) {
+	short sp_offset;
+	short fp_offset;
+	short ra_offset;
+	unsigned int sp_reg:4;
+	unsigned int fp_reg:4;
+	unsigned int ra_reg:4;
+	unsigned int type:3;
+	unsigned int signal:1;
+} loongarch64_kernel_orc_entry;
+
+#define LOONGARCH64_ORC_REG_UNDEFINED	0
+#define LOONGARCH64_ORC_REG_PREV_SP	1
+#define LOONGARCH64_ORC_REG_SP		2
+#define LOONGARCH64_ORC_REG_FP		3
+
+#define LOONGARCH64_ORC_TYPE_UNDEFINED	0
+#define LOONGARCH64_ORC_TYPE_END_OF_STACK 1
+#define LOONGARCH64_ORC_TYPE_CALL	2
+#define LOONGARCH64_ORC_TYPE_REGS	3
+
+#define LOONGARCH64_LOOKUP_BLOCK_ORDER	8
+#define LOONGARCH64_LOOKUP_BLOCK_SIZE	(1 << LOONGARCH64_LOOKUP_BLOCK_ORDER)
 
 static int loongarch64_pgd_vtop(ulong *pgd, ulong vaddr,
 			physaddr_t *paddr, int verbose);
@@ -77,6 +102,10 @@ static int loongarch64_init_active_task_regs(void);
 static int loongarch64_get_crash_notes(void);
 static int loongarch64_get_elf_notes(void);
 static void loongarch64_irq_stack_init(void);
+static void loongarch64_ORC_init(void);
+static int loongarch64_orc_unwind(struct bt_info *bt,
+			struct loongarch64_unwind_frame *current,
+			struct loongarch64_unwind_frame *previous);
 static int loongarch64_on_irq_stack(int cpu, ulong stkptr);
 static void loongarch64_set_irq_stack(struct bt_info *bt);
 static int loongarch64_switch_from_irq_stack(struct bt_info *bt,
@@ -455,11 +484,12 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 	if (bt->flags & BT_REGS_NOT_FOUND)
 		return;
 
-	previous.sp = previous.pc = previous.ra = 0;
+	previous.sp = previous.pc = previous.ra = previous.fp = 0;
 
 	current.pc = bt->instptr;
 	current.sp = bt->stkptr;
 	current.ra = 0;
+	current.fp = 0;
 
 	if (!INSTACK(current.sp, bt) &&
 	    (bt->flags & BT_REGS_NOT_FOUND) == 0 &&
@@ -472,6 +502,7 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 	if (bt->machdep) {
 		regs = (struct loongarch64_pt_regs *)bt->machdep;
 		previous.pc = current.ra = regs->regs[LOONGARCH64_EF_RA];
+		current.fp = regs->regs[LOONGARCH64_EF_FP];
 	}
 
 	while (current.sp <= bt->stacktop - SIZE(pt_regs)) {
@@ -537,12 +568,15 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 			}
 		}
 
-		if (symbol && loongarch64_is_exception_entry(symbol)) {
+		if (loongarch64_orc_unwind(bt, &current, &previous)) {
+			/* ORC has already calculated the caller frame. */
+		} else if (symbol && loongarch64_is_exception_entry(symbol)) {
 
 			GET_STACK_DATA(current.sp, pt_regs, sizeof(pt_regs));
 			regs = (struct loongarch64_pt_regs *) (pt_regs + OFFSET(pt_regs_regs));
 			previous.ra = regs->regs[LOONGARCH64_EF_RA];
 			previous.sp = regs->regs[LOONGARCH64_EF_SP];
+			previous.fp = regs->regs[LOONGARCH64_EF_FP];
 			current.ra = regs->csr_epc;
 
 			if (CRASHDEBUG(8))
@@ -568,12 +602,13 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 		current.pc = current.ra;
 		current.sp = previous.sp;
 		current.ra = previous.ra;
+		current.fp = previous.fp;
 
 		if (CRASHDEBUG(8))
 			fprintf(fp, "next %d pc %#lx ra %#lx sp %lx\n",
 				level, current.pc, current.ra, current.sp);
 
-		previous.sp = previous.pc = previous.ra = 0;
+		previous.sp = previous.pc = previous.ra = previous.fp = 0;
 	}
 }
 
@@ -849,6 +884,287 @@ loongarch64_irq_stack_init(void)
 		    "IRQ stack pointer", RETURN_ON_ERROR))
 			ms->irq_stacks[i] = 0;
 	}
+}
+
+
+static int
+loongarch64_orc_ip(ulong ip_entry_addr, ulong *ip)
+{
+	int ip_entry;
+
+	if (!readmem(ip_entry_addr, KVADDR, &ip_entry, sizeof(ip_entry),
+	    "LoongArch ORC ip", RETURN_ON_ERROR|QUIET))
+		return FALSE;
+
+	*ip = ip_entry_addr + ip_entry;
+	return TRUE;
+}
+
+static struct loongarch64_orc_entry *
+loongarch64_orc_get_entry(struct loongarch64_ORC_data *orc)
+{
+	loongarch64_kernel_orc_entry korc;
+	struct loongarch64_orc_entry *entry = &orc->orc_entry_data;
+
+	if (!readmem(orc->orc_entry, KVADDR, &korc, sizeof(korc),
+	    "LoongArch ORC entry", RETURN_ON_ERROR|QUIET))
+		return NULL;
+
+	entry->sp_offset = korc.sp_offset;
+	entry->fp_offset = korc.fp_offset;
+	entry->ra_offset = korc.ra_offset;
+	entry->sp_reg = korc.sp_reg;
+	entry->fp_reg = korc.fp_reg;
+	entry->ra_reg = korc.ra_reg;
+	entry->type = korc.type;
+	entry->signal = korc.signal;
+
+	return entry;
+}
+
+static struct loongarch64_orc_entry *
+loongarch64_orc_find_in_table(ulong ip_table, ulong orc_table,
+			uint num_entries, ulong ip)
+{
+	int index;
+	ulong first, last, mid, found, vaddr;
+	struct machine_specific *ms = machdep->machspec;
+	struct loongarch64_ORC_data *orc = &ms->orc;
+
+	if (!num_entries)
+		return NULL;
+
+	first = ip_table;
+	last = ip_table + ((num_entries - 1) * sizeof(int));
+	found = first;
+
+	while (first <= last) {
+		mid = first + (((last - first) / sizeof(int)) / 2) *
+		    sizeof(int);
+
+		if (!loongarch64_orc_ip(mid, &vaddr))
+			return NULL;
+
+		if (vaddr <= ip) {
+			found = mid;
+			first = mid + sizeof(int);
+		} else {
+			if (mid == ip_table)
+				break;
+			last = mid - sizeof(int);
+		}
+	}
+
+	index = (found - ip_table) / sizeof(int);
+	orc->ip_entry = found;
+	orc->orc_entry = orc_table + (index * SIZE(orc_entry));
+
+	return loongarch64_orc_get_entry(orc);
+}
+
+static struct loongarch64_orc_entry *
+loongarch64_orc_find(ulong ip)
+{
+	uint idx, start, stop, num_entries;
+	struct machine_specific *ms = machdep->machspec;
+	struct loongarch64_ORC_data *orc = &ms->orc;
+
+	if (!orc->enabled)
+		return NULL;
+
+	if ((ip >= kt->stext) && (ip < kt->etext)) {
+		if (orc->lookup_num_blocks < 2)
+			return NULL;
+
+		idx = (ip - kt->stext) / LOONGARCH64_LOOKUP_BLOCK_SIZE;
+		if (idx >= orc->lookup_num_blocks - 1)
+			return NULL;
+
+		if (!readmem(orc->orc_lookup + (idx * sizeof(uint)), KVADDR,
+		    &start, sizeof(start), "LoongArch ORC lookup start",
+		    RETURN_ON_ERROR|QUIET))
+			return NULL;
+		if (!readmem(orc->orc_lookup + ((idx + 1) * sizeof(uint)),
+		    KVADDR,
+		    &stop, sizeof(stop), "LoongArch ORC lookup stop",
+		    RETURN_ON_ERROR|QUIET))
+			return NULL;
+		stop++;
+
+		if ((orc->__start_orc_unwind + (start * SIZE(orc_entry))) >=
+		    orc->__stop_orc_unwind)
+			return NULL;
+		if ((orc->__start_orc_unwind + (stop * SIZE(orc_entry))) >
+		    orc->__stop_orc_unwind)
+			return NULL;
+
+		return loongarch64_orc_find_in_table(
+		    orc->__start_orc_unwind_ip + (start * sizeof(int)),
+		    orc->__start_orc_unwind + (start * SIZE(orc_entry)),
+		    stop - start, ip);
+	}
+
+	if (is_kernel_text(ip)) {
+		num_entries = (orc->__stop_orc_unwind_ip -
+		    orc->__start_orc_unwind_ip) / sizeof(int);
+		return loongarch64_orc_find_in_table(orc->__start_orc_unwind_ip,
+		    orc->__start_orc_unwind, num_entries, ip);
+	}
+
+	return NULL;
+}
+
+static int
+loongarch64_orc_read_stack(ulong addr, ulong *value)
+{
+	return readmem(addr, KVADDR, value, sizeof(*value),
+	    "LoongArch ORC stack", RETURN_ON_ERROR|QUIET);
+}
+
+static ulong
+loongarch64_orc_adjust_pc(ulong ra)
+{
+	return is_kernel_text(ra) ? ra : 0;
+}
+
+static int
+loongarch64_orc_unwind(struct bt_info *bt,
+			struct loongarch64_unwind_frame *current,
+			struct loongarch64_unwind_frame *previous)
+{
+	ulong cfa, pcval, fpval = current->fp;
+	struct loongarch64_orc_entry *orc;
+	struct loongarch64_pt_regs regs;
+
+	(void)bt;
+
+	orc = loongarch64_orc_find(current->pc);
+	if (!orc)
+		return FALSE;
+
+	if (CRASHDEBUG(8))
+		fprintf(fp,
+		    "orc pc %lx sp %lx fp %lx -> spo %d fpo %d rao %d "
+		    "spr %u fpr %u rar %u type %u\n",
+		    current->pc, current->sp, current->fp, orc->sp_offset,
+		    orc->fp_offset, orc->ra_offset, orc->sp_reg, orc->fp_reg,
+		    orc->ra_reg, orc->type);
+
+	if (orc->type == LOONGARCH64_ORC_TYPE_UNDEFINED ||
+	    orc->type == LOONGARCH64_ORC_TYPE_END_OF_STACK)
+		return FALSE;
+
+	switch (orc->sp_reg) {
+	case LOONGARCH64_ORC_REG_SP:
+		cfa = current->sp + orc->sp_offset;
+		break;
+	case LOONGARCH64_ORC_REG_FP:
+		if (!current->fp)
+			return FALSE;
+		cfa = current->fp;
+		break;
+	default:
+		return FALSE;
+	}
+
+	switch (orc->fp_reg) {
+	case LOONGARCH64_ORC_REG_PREV_SP:
+		if (!loongarch64_orc_read_stack(cfa + orc->fp_offset, &fpval))
+			return FALSE;
+		break;
+	case LOONGARCH64_ORC_REG_UNDEFINED:
+		break;
+	default:
+		return FALSE;
+	}
+
+	switch (orc->type) {
+	case LOONGARCH64_ORC_TYPE_CALL:
+		if (orc->ra_reg == LOONGARCH64_ORC_REG_PREV_SP) {
+			if (!loongarch64_orc_read_stack(cfa + orc->ra_offset,
+			    &pcval))
+				return FALSE;
+		} else if (orc->ra_reg == LOONGARCH64_ORC_REG_UNDEFINED) {
+			if (!current->ra || current->ra == current->pc)
+				return FALSE;
+			pcval = current->ra;
+		} else {
+			return FALSE;
+		}
+		pcval = loongarch64_orc_adjust_pc(pcval);
+		if (!pcval && is_kernel_text(current->ra))
+			pcval = current->ra;
+		if (!pcval)
+			return FALSE;
+		previous->sp = cfa;
+		previous->fp = fpval;
+		previous->ra = 0;
+		current->ra = pcval;
+		return TRUE;
+
+	case LOONGARCH64_ORC_TYPE_REGS:
+		if (!readmem(cfa, KVADDR, &regs, sizeof(regs),
+		    "LoongArch ORC pt_regs", RETURN_ON_ERROR|QUIET))
+			return FALSE;
+		pcval = regs.csr_epc;
+		if (!is_kernel_text(pcval))
+			return FALSE;
+		previous->sp = regs.regs[LOONGARCH64_EF_SP];
+		previous->fp = regs.regs[LOONGARCH64_EF_FP];
+		previous->ra = regs.regs[LOONGARCH64_EF_RA];
+		current->ra = pcval;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+static void
+loongarch64_ORC_init(void)
+{
+	int i;
+	char *orc_symbols[] = {
+		"lookup_num_blocks",
+		"__start_orc_unwind_ip",
+		"__stop_orc_unwind_ip",
+		"__start_orc_unwind",
+		"__stop_orc_unwind",
+		"orc_lookup",
+		NULL
+	};
+	struct machine_specific *ms = machdep->machspec;
+	struct loongarch64_ORC_data *orc = &ms->orc;
+
+	STRUCT_SIZE_INIT(orc_entry, "orc_entry");
+	if (!VALID_STRUCT(orc_entry) ||
+	    SIZE(orc_entry) != sizeof(loongarch64_kernel_orc_entry))
+		return;
+
+	if (!MEMBER_EXISTS("orc_entry", "sp_offset") ||
+	    !MEMBER_EXISTS("orc_entry", "fp_offset") ||
+	    !MEMBER_EXISTS("orc_entry", "ra_offset") ||
+	    !MEMBER_EXISTS("orc_entry", "sp_reg") ||
+	    !MEMBER_EXISTS("orc_entry", "fp_reg") ||
+	    !MEMBER_EXISTS("orc_entry", "ra_reg") ||
+	    !MEMBER_EXISTS("orc_entry", "type"))
+		return;
+
+	for (i = 0; orc_symbols[i]; i++) {
+		if (!symbol_exists(orc_symbols[i]))
+			return;
+	}
+
+	if (!readmem(symbol_value("lookup_num_blocks"), KVADDR,
+	    &orc->lookup_num_blocks, sizeof(orc->lookup_num_blocks),
+	    "LoongArch ORC lookup_num_blocks", RETURN_ON_ERROR|QUIET))
+		return;
+
+	orc->__start_orc_unwind_ip = symbol_value("__start_orc_unwind_ip");
+	orc->__stop_orc_unwind_ip = symbol_value("__stop_orc_unwind_ip");
+	orc->__start_orc_unwind = symbol_value("__start_orc_unwind");
+	orc->__stop_orc_unwind = symbol_value("__stop_orc_unwind");
+	orc->orc_lookup = symbol_value("orc_lookup");
+	orc->enabled = TRUE;
 }
 
 static int
@@ -1430,6 +1746,7 @@ loongarch64_init(int when)
 					&machdep->nr_irqs);
 
 		loongarch64_stackframe_init();
+		loongarch64_ORC_init();
 
 		if (!machdep->hz)
 			machdep->hz = 250;

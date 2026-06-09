@@ -7330,6 +7330,30 @@ void loongarch64_dump_machdep_table(ulong);
 
 #define KSYMS_START     (0x1)
 
+struct loongarch64_orc_entry {
+	short sp_offset;
+	short fp_offset;
+	short ra_offset;
+	uint sp_reg;
+	uint fp_reg;
+	uint ra_reg;
+	uint type;
+	uint signal;
+};
+
+struct loongarch64_ORC_data {
+	int enabled;
+	uint lookup_num_blocks;
+	ulong __start_orc_unwind_ip;
+	ulong __stop_orc_unwind_ip;
+	ulong __start_orc_unwind;
+	ulong __stop_orc_unwind;
+	ulong orc_lookup;
+	ulong ip_entry;
+	ulong orc_entry;
+	struct loongarch64_orc_entry orc_entry_data;
+};
+
 struct machine_specific {
 	ulong phys_base;
 	ulong vmalloc_start_addr;
@@ -7339,6 +7363,7 @@ struct machine_specific {
 	ulong irq_stack_size;
 	ulong *irq_stacks;
 	struct loongarch64_pt_regs *crash_task_regs;
+	struct loongarch64_ORC_data orc;
 };
 
 /*
