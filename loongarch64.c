@@ -749,13 +749,12 @@ loongarch64_dump_backtrace_entry(struct bt_info *bt, struct syment *sym,
 			fprintf(fp, "    %s\n", buf);
 	}
 
-	if (sym && loongarch64_is_exception_entry(sym)) {
-		GET_STACK_DATA(current->sp, &pt_regs, SIZE(pt_regs));
-		loongarch64_dump_exception_stack(bt, pt_regs);
-	}
-
 	/* bt -f */
 	if (bt->flags & BT_FULL) {
+		if (sym && loongarch64_is_exception_entry(sym)) {
+			GET_STACK_DATA(current->sp, &pt_regs, SIZE(pt_regs));
+			loongarch64_dump_exception_stack(bt, pt_regs);
+		}
 		fprintf(fp, "    "
 			"[PC: %016lx RA: %016lx SP: %016lx SIZE: %ld]\n",
 			current->pc, current->ra, current->sp,
