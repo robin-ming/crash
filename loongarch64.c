@@ -752,7 +752,7 @@ loongarch64_dump_exception_stack(struct bt_info *bt, char *pt_regs)
 	}
 
 	value_to_symstr(regs->csr_epc, buf, 16);
-	fprintf(fp, "    epc      : %016lx %s\n", regs->csr_epc, buf);
+	fprintf(fp, "    era      : %016lx %s\n", regs->csr_epc, buf);
 
 	value_to_symstr(regs->regs[LOONGARCH64_EF_RA], buf, 16);
 	fprintf(fp, "    ra       : %016lx %s\n", regs->regs[LOONGARCH64_EF_RA], buf);
@@ -1799,10 +1799,10 @@ loongarch64_display_regs_from_elf_notes(int cpu, FILE *ofp)
 		"    R24: %016lx  R25: %016lx  R26: %016lx\n"
 		"    R27: %016lx  R28: %016lx  R29: %016lx\n"
 		"    R30: %016lx  R31: %016lx\n"
-		"    CSR epc : %016lx    CSR badv: %016lx\n"
+		"    CSR era : %016lx    CSR badv: %016lx\n"
 		"    CSR crmd: %08lx            CSR prmd: %08lx\n"
 		"    CSR ecfg: %08lx           CSR estat: %08lx\n"
-		"    CSR eneu: %08lx",
+		"    CSR euen: %08lx",
 		regs->regs[LOONGARCH64_EF_R0],
 		regs->regs[LOONGARCH64_EF_R0 + 1],
 		regs->regs[LOONGARCH64_EF_R0 + 2],
