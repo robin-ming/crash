@@ -1224,8 +1224,12 @@ loongarch64_find_next_kernel_text(struct bt_info *bt,
 	ulong sp, pc, offset;
 	struct syment *symbol;
 
-	for (sp = current->sp + sizeof(ulong); sp < bt->stacktop;
-	    sp += sizeof(ulong)) {
+	if (!INSTACK(current->sp, bt))
+		return FALSE;
+
+	sp = current->sp + sizeof(ulong);
+	sp = roundup(sp, sizeof(ulong));
+	for (; sp < bt->stacktop; sp += sizeof(ulong)) {
 		GET_STACK_DATA(sp, &pc, sizeof(pc));
 		if (!is_kernel_text(pc))
 			continue;
