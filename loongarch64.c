@@ -480,6 +480,7 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 	char pt_regs[SIZE(pt_regs)];
 	int level = 0;
 	int invalid_ok = 1;
+	int on_irq_stack;
 
 	if (bt->flags & BT_REGS_NOT_FOUND)
 		return;
@@ -499,9 +500,17 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 	if (!INSTACK(current.sp, bt))
 		return;
 
+	on_irq_stack = loongarch64_on_irq_stack(bt->tc->processor, current.sp);
 	if (bt->machdep) {
 		regs = (struct loongarch64_pt_regs *)bt->machdep;
-		previous.pc = current.ra = regs->regs[LOONGARCH64_EF_RA];
+		/*
+		 * For active dumpfile frames stopped on the IRQ stack, the
+		 * PRSTATUS RA may not describe the caller of the interrupted
+		 * kernel frame.  Let normal unwind or IRQ-stack handoff find
+		 * the next frame instead of injecting a bogus caller.
+		 */
+		if (!on_irq_stack)
+			previous.pc = current.ra = regs->regs[LOONGARCH64_EF_RA];
 		current.fp = regs->regs[LOONGARCH64_EF_FP];
 	}
 
