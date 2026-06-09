@@ -94,6 +94,7 @@ static void loongarch64_dump_exception_stack(struct bt_info *bt, char *pt_regs);
 static int loongarch64_is_exception_entry(struct syment *sym);
 static ulong loongarch64_exception_pc(int cpu, ulong pc);
 static int loongarch64_is_unwind_text(ulong pc);
+static int loongarch64_use_irq_prstatus_ra(ulong pc, ulong ra);
 static int loongarch64_eframe_search(struct bt_info *bt);
 static void loongarch64_display_full_frame(struct bt_info *bt,
 			struct loongarch64_unwind_frame *current,
@@ -509,12 +510,13 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 	if (bt->machdep) {
 		regs = (struct loongarch64_pt_regs *)bt->machdep;
 		/*
-		 * For active dumpfile frames stopped on the IRQ stack, the
-		 * PRSTATUS RA may not describe the caller of the interrupted
-		 * kernel frame.  Let normal unwind or IRQ-stack handoff find
-		 * the next frame instead of injecting a bogus caller.
+		 * PRSTATUS RA from IRQ stacks is not always a reliable caller for
+		 * hypervisor dumps.  Use it only for IRQ leaf frames where it keeps
+		 * the in-flight interrupt call chain before crossing stacks.
 		 */
-		if (!on_irq_stack)
+		if (!on_irq_stack ||
+		    loongarch64_use_irq_prstatus_ra(current.pc,
+		    regs->regs[LOONGARCH64_EF_RA]))
 			previous.pc = current.ra = regs->regs[LOONGARCH64_EF_RA];
 		current.fp = regs->regs[LOONGARCH64_EF_FP];
 	}
@@ -629,6 +631,12 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 				level, current.pc, current.ra, current.sp);
 
 		previous.sp = previous.pc = previous.ra = previous.fp = 0;
+
+		if (current.sp >= bt->stacktop &&
+		    loongarch64_switch_from_irq_stack(bt, &current)) {
+			invalid_ok = 1;
+			continue;
+		}
 	}
 }
 
@@ -902,6 +910,25 @@ loongarch64_is_unwind_text(ulong pc)
 		return FALSE;
 
 	return TRUE;
+}
+
+static int
+loongarch64_use_irq_prstatus_ra(ulong pc, ulong ra)
+{
+	struct syment *pcsym, *rasym;
+	ulong offset;
+
+	if (!loongarch64_is_unwind_text(pc) ||
+	    !loongarch64_is_unwind_text(ra))
+		return FALSE;
+
+	pcsym = value_search(pc, &offset);
+	rasym = value_search(ra, &offset);
+	if (!pcsym || !rasym)
+		return FALSE;
+
+	return STREQ(pcsym->name, "generic_handle_domain_irq") &&
+	    STREQ(rasym->name, "handle_cpu_irq");
 }
 
 /*
@@ -1302,7 +1329,9 @@ loongarch64_switch_from_irq_stack(struct bt_info *bt,
 	struct machine_specific *ms = machdep->machspec;
 	ulong saved_sp_addr, saved_sp;
 
-	if (!loongarch64_on_irq_stack(bt->tc->processor, current->sp))
+	if (!ms->irq_stacks || current->sp < ms->irq_stacks[bt->tc->processor] ||
+	    current->sp > ms->irq_stacks[bt->tc->processor] +
+	    ms->irq_stack_size + 64)
 		return FALSE;
 
 	saved_sp_addr = ms->irq_stacks[bt->tc->processor] +
