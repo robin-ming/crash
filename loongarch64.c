@@ -67,6 +67,9 @@ typedef struct __attribute__((__packed__)) {
 
 #define LOONGARCH64_LOOKUP_BLOCK_ORDER	8
 #define LOONGARCH64_LOOKUP_BLOCK_SIZE	(1 << LOONGARCH64_LOOKUP_BLOCK_ORDER)
+#define LOONGARCH64_VECSIZE		0x200
+#define LOONGARCH64_EXCCODE_INT_START	64
+#define LOONGARCH64_EXCCODE_INT_END	78
 
 static int loongarch64_pgd_vtop(ulong *pgd, ulong vaddr,
 			physaddr_t *paddr, int verbose);
@@ -89,6 +92,8 @@ static void loongarch64_dump_backtrace_entry(struct bt_info *bt,
 			struct loongarch64_unwind_frame *previous, int level);
 static void loongarch64_dump_exception_stack(struct bt_info *bt, char *pt_regs);
 static int loongarch64_is_exception_entry(struct syment *sym);
+static ulong loongarch64_exception_pc(int cpu, ulong pc);
+static int loongarch64_is_unwind_text(ulong pc);
 static int loongarch64_eframe_search(struct bt_info *bt);
 static void loongarch64_display_full_frame(struct bt_info *bt,
 			struct loongarch64_unwind_frame *current,
@@ -514,9 +519,11 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 		current.fp = regs->regs[LOONGARCH64_EF_FP];
 	}
 
-	while (current.sp <= bt->stacktop - SIZE(pt_regs)) {
+	while (current.sp < bt->stacktop) {
 		struct syment *symbol = NULL;
 		ulong offset;
+
+		current.pc = loongarch64_exception_pc(bt->tc->processor, current.pc);
 
 		if (CRASHDEBUG(8))
 			fprintf(fp, "level %d pc %#lx ra %#lx sp %lx\n",
@@ -532,7 +539,8 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 		}
 
 		symbol = value_search(current.pc, &offset);
-		if (!symbol && !invalid_ok) {
+		if ((!symbol || !loongarch64_is_unwind_text(current.pc)) &&
+		    !invalid_ok) {
 			if (loongarch64_switch_from_irq_stack(bt, &current) ||
 			    loongarch64_find_next_kernel_text(bt, &current)) {
 				invalid_ok = 1;
@@ -541,6 +549,8 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 			error(FATAL, "PC is unknown symbol (%lx)", current.pc);
 			return;
 		}
+		if (symbol && !loongarch64_is_unwind_text(current.pc))
+			symbol = NULL;
 		invalid_ok = 0;
 
 		/*
@@ -579,7 +589,8 @@ loongarch64_back_trace_cmd(struct bt_info *bt)
 
 		if (loongarch64_orc_unwind(bt, &current, &previous)) {
 			/* ORC has already calculated the caller frame. */
-		} else if (symbol && loongarch64_is_exception_entry(symbol)) {
+		} else if (symbol && loongarch64_is_exception_entry(symbol) &&
+		    current.sp <= bt->stacktop - SIZE(pt_regs)) {
 
 			GET_STACK_DATA(current.sp, pt_regs, sizeof(pt_regs));
 			regs = (struct loongarch64_pt_regs *) (pt_regs + OFFSET(pt_regs_regs));
@@ -760,7 +771,8 @@ loongarch64_dump_exception_stack(struct bt_info *bt, char *pt_regs)
 			regs->regs[i+2], regs->regs[i+3]);
 	}
 
-	value_to_symstr(regs->csr_epc, buf, 16);
+	value_to_symstr(loongarch64_exception_pc(bt->tc->processor, regs->csr_epc),
+	    buf, 16);
 	fprintf(fp, "    era      : %016lx %s\n", regs->csr_epc, buf);
 
 	value_to_symstr(regs->regs[LOONGARCH64_EF_RA], buf, 16);
@@ -806,6 +818,90 @@ loongarch64_is_exception_entry(struct syment *sym)
 		STREQ(sym->name, "handle_vint") ||
 		STREQ(sym->name, "handle_watch") ||
 		STREQ(sym->name, "handle_lasx");
+}
+
+static ulong
+loongarch64_exception_pc(int cpu, ulong pc)
+{
+	ulong eentry, pcpu_handler, offset, type, func;
+	ulong exception_table, exception_handlers;
+	int i;
+
+	if (!IS_KVADDR(pc) || !symbol_exists("exception_handlers"))
+		return pc;
+
+	exception_handlers = symbol_value("exception_handlers");
+	eentry = exception_handlers;
+	if (symbol_exists("eentry"))
+		readmem(symbol_value("eentry"), KVADDR, &eentry, sizeof(eentry),
+		    "LoongArch eentry", RETURN_ON_ERROR|QUIET);
+
+	if (symbol_exists("pcpu_handlers")) {
+		for (i = 0; i < kt->cpus; i++) {
+			if (cpu >= 0 && cpu < kt->cpus && i != cpu)
+				continue;
+			if (!readmem(symbol_value("pcpu_handlers") + (i * sizeof(ulong)),
+			    KVADDR, &pcpu_handler, sizeof(pcpu_handler),
+			    "LoongArch pcpu_handlers", RETURN_ON_ERROR|QUIET))
+				continue;
+			if (!pcpu_handler)
+				continue;
+			if (pc >= pcpu_handler &&
+			    pc < pcpu_handler + LOONGARCH64_VECSIZE * 128) {
+				pc = pc + eentry - pcpu_handler;
+				break;
+			}
+		}
+	}
+
+	if (pc < eentry ||
+	    pc >= eentry +
+	    (LOONGARCH64_EXCCODE_INT_END + 1) * LOONGARCH64_VECSIZE)
+		return pc;
+
+	offset = (pc - eentry) % LOONGARCH64_VECSIZE;
+	type = (pc - eentry) / LOONGARCH64_VECSIZE;
+
+	if (type < LOONGARCH64_EXCCODE_INT_START &&
+	    symbol_exists("exception_table")) {
+		exception_table = symbol_value("exception_table");
+		if (!readmem(exception_table + (type * sizeof(ulong)), KVADDR,
+		    &func, sizeof(func), "LoongArch exception_table",
+		    RETURN_ON_ERROR|QUIET))
+			func = 0;
+	} else if (type >= LOONGARCH64_EXCCODE_INT_START &&
+	    type <= LOONGARCH64_EXCCODE_INT_END && symbol_exists("handle_vint")) {
+		func = symbol_value("handle_vint");
+	} else if (symbol_exists("handle_reserved")) {
+		func = symbol_value("handle_reserved");
+	} else {
+		func = 0;
+	}
+
+	if (!func)
+		return pc;
+
+	return func + offset;
+}
+
+static int
+loongarch64_is_unwind_text(ulong pc)
+{
+	struct syment *symbol;
+	ulong offset;
+
+	if (!is_kernel_text(pc))
+		return FALSE;
+
+	symbol = value_search(pc, &offset);
+	if (!symbol || symbol->name[0] == '.' ||
+	    STREQ(symbol->name, "_PROCEDURE_LINKAGE_TABLE_") ||
+	    STREQ(symbol->name, "empty_zero_page") ||
+	    STRNEQ(symbol->name, "__start_") ||
+	    STRNEQ(symbol->name, "__end_"))
+		return FALSE;
+
+	return TRUE;
 }
 
 /*
@@ -1031,9 +1127,10 @@ loongarch64_orc_read_stack(ulong addr, ulong *value)
 }
 
 static ulong
-loongarch64_orc_adjust_pc(ulong ra)
+loongarch64_orc_adjust_pc(int cpu, ulong ra)
 {
-	return is_kernel_text(ra) ? ra : 0;
+	ra = loongarch64_exception_pc(cpu, ra);
+	return loongarch64_is_unwind_text(ra) ? ra : 0;
 }
 
 static int
@@ -1100,9 +1197,9 @@ loongarch64_orc_unwind(struct bt_info *bt,
 		} else {
 			return FALSE;
 		}
-		pcval = loongarch64_orc_adjust_pc(pcval);
-		if (!pcval && is_kernel_text(current->ra))
-			pcval = current->ra;
+		pcval = loongarch64_orc_adjust_pc(bt->tc->processor, pcval);
+		if (!pcval)
+			pcval = loongarch64_orc_adjust_pc(bt->tc->processor, current->ra);
 		if (!pcval)
 			return FALSE;
 		previous->sp = cfa;
@@ -1115,8 +1212,8 @@ loongarch64_orc_unwind(struct bt_info *bt,
 		if (!readmem(cfa, KVADDR, &regs, sizeof(regs),
 		    "LoongArch ORC pt_regs", RETURN_ON_ERROR|QUIET))
 			return FALSE;
-		pcval = regs.csr_epc;
-		if (!is_kernel_text(pcval))
+		pcval = loongarch64_exception_pc(bt->tc->processor, regs.csr_epc);
+		if (!loongarch64_is_unwind_text(pcval))
 			return FALSE;
 		previous->sp = regs.regs[LOONGARCH64_EF_SP];
 		previous->fp = regs.regs[LOONGARCH64_EF_FP];
@@ -1240,12 +1337,15 @@ loongarch64_find_next_kernel_text(struct bt_info *bt,
 	sp = roundup(sp, sizeof(ulong));
 	for (; sp < bt->stacktop; sp += sizeof(ulong)) {
 		GET_STACK_DATA(sp, &pc, sizeof(pc));
-		if (!is_kernel_text(pc))
+		pc = loongarch64_exception_pc(bt->tc->processor, pc);
+		if (!loongarch64_is_unwind_text(pc))
 			continue;
 
 		symbol = value_search(pc, &offset);
 		if (!symbol || STREQ(symbol->name, "_PROCEDURE_LINKAGE_TABLE_") ||
-		    STREQ(symbol->name, "empty_zero_page"))
+		    STREQ(symbol->name, "empty_zero_page") ||
+		    STRNEQ(symbol->name, "__start_") ||
+		    STRNEQ(symbol->name, "__end_"))
 			continue;
 
 		current->pc = pc;
